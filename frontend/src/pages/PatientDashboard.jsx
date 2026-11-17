@@ -1,9 +1,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { API_BASE_URL } from "../config";
 import "./Dashboard.css";
 
-const API = `${import.meta.env.VITE_API_URL}/api`;
+const API = `${API_BASE_URL}/api`;
 
 const apiFetch = (path, options = {}) => fetch(`${API}${path}`, {
   ...options,

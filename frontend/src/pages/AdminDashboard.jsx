@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { API_BASE_URL } from "../config";
 import "./AdminDashboard.css";
 
-const API = import.meta.env.VITE_API_URL;
+const API = API_BASE_URL;
 
 const NAV_ITEMS = [
   ["overview", "Overview", "OV"],

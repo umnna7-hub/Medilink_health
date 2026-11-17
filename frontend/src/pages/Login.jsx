@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import logo from "../../medilink-health-transparent (1).png";
+import { API_BASE_URL } from "../config";
 import "./login.css";
 
 function Login() {
@@ -18,7 +19,7 @@ function Login() {
     setLoading(true);
 
     try {
-      const response = await fetch(`${import.meta.env.VITE_API_URL}/api/login`, {
+      const response = await fetch(`${API_BASE_URL}/api/login`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
