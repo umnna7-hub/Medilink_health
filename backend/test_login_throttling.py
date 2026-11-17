@@ -152,11 +152,11 @@ class LoginThrottlingTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("token", response.get_json())
-        cookie = response.headers["Set-Cookie"]
-        self.assertIn("medilink_session=", cookie)
-        self.assertIn("HttpOnly", cookie)
-        self.assertIn("Secure", cookie)
-        self.assertIn("SameSite=Lax", cookie)
+        cookies = "\n".join(response.headers.getlist("Set-Cookie"))
+        self.assertIn("medilink_session=", cookies)
+        self.assertIn("HttpOnly", cookies)
+        self.assertIn("Secure", cookies)
+        self.assertIn("SameSite=Lax", cookies)
         self.assertEqual(
             response.headers["Access-Control-Allow-Credentials"], "true"
         )

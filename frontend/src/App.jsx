@@ -5,6 +5,14 @@ import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
 import PatientDashboard from "./pages/PatientDashboard";
+import DoctorDashboard from "./pages/DoctorDashboard";
+import AcceptInvite from "./pages/AcceptInvite";
+import MfaSetup from "./pages/MfaSetup";
+import ProtectedRoute from "./components/ProtectedRoute";
+
+const ADMIN_ROLE = ["admin"];
+const DOCTOR_ROLE = ["doctor"];
+const PATIENT_ROLE = ["patient"];
 const services = [
   {
     icon: "📅",
@@ -204,14 +212,37 @@ function App() {
         <Route path="/" element={<HomePage />} />
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
-        <Route
-  path="/admin-dashboard"
-  element={<AdminDashboard />}
-/>
-        <Route
-  path="/patient-dashboard"
-  element={<PatientDashboard />}
-/>
+       <Route path="/invite/:token" element={<AcceptInvite />} />
+       <Route path="/mfa-setup" element={<MfaSetup />} />
+       <Route
+         path="/admin-dashboard"
+         element={
+           <ProtectedRoute allowedRoles={ADMIN_ROLE}>
+             <AdminDashboard />
+           </ProtectedRoute>
+         }
+       />
+       <Route
+         path="/doctor-dashboard"
+         element={
+           <ProtectedRoute allowedRoles={DOCTOR_ROLE}>
+             <DoctorDashboard />
+           </ProtectedRoute>
+         }
+       />
+       <Route
+         path="/patient-dashboard"
+         element={
+           <ProtectedRoute allowedRoles={PATIENT_ROLE}>
+             <PatientDashboard />
+           </ProtectedRoute>
+         }
+       />
+       <Route path="*" element={<main className="not-found-page">
+         <h1>Page not found</h1>
+         <p>The page you requested does not exist.</p>
+         <Link to="/">Return home</Link>
+       </main>} />
       </Routes>
     </BrowserRouter>
   );

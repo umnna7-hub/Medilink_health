@@ -621,6 +621,37 @@
   font-size: 11px;
 }
 
+.invite-link-panel {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 20px;
+  padding: 14px;
+  border: 1px solid var(--admin-border);
+  border-radius: 9px;
+  background: #f7fbfc;
+}
+
+.invite-link-panel label {
+  color: var(--admin-navy);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.invite-link-panel > div {
+  display: flex;
+  gap: 9px;
+}
+
+.invite-link-panel input {
+  min-width: 0;
+  flex: 1;
+  padding: 9px 10px;
+  border: 1px solid var(--admin-border);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--admin-navy);
+}
+
 .facility-card > small {
   color: var(--admin-muted);
   font-size: 10px;

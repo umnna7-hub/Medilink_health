@@ -1,23 +1,100 @@
-from flask import Flask, jsonify, request
+from flask import Flask, has_request_context, jsonify, request
 from flask_cors import CORS
 from database import get_db_connection
+from cryptography.fernet import Fernet, InvalidToken
 from werkzeug.security import generate_password_hash, check_password_hash
 from mysql.connector import IntegrityError
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from email.message import EmailMessage
+import hashlib
+import hmac
 import json
 import logging
 import jwt
 import os
-import pyotp
+import base64
+import struct
 import re
+import secrets
+import smtplib
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import unquote_plus
+from urllib.parse import quote, unquote_plus
+
+
+class _TOTP:
+    def __init__(self, secret):
+        self.secret = secret
+
+    def verify(self, code, valid_window=0):
+        if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code):
+            return False
+
+        padded_secret = self.secret.upper() + "=" * ((-len(self.secret)) % 8)
+        try:
+            key = base64.b32decode(padded_secret, casefold=True)
+        except (base64.binascii.Error, ValueError):
+            return False
+
+        counter = int(time.time()) // 30
+        for window in range(-valid_window, valid_window + 1):
+            digest = hmac.new(
+                key,
+                struct.pack(">Q", counter + window),
+                hashlib.sha1,
+            ).digest()
+            offset = digest[-1] & 0x0F
+            binary = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+            candidate = f"{binary % 1000000:06d}"
+            if hmac.compare_digest(candidate, code):
+                return True
+        return False
+
+    def provisioning_uri(self, name, issuer_name):
+        return (
+            "otpauth://totp/"
+            f"{quote(issuer_name)}:{quote(name)}"
+            f"?secret={quote(self.secret)}"
+            f"&issuer={quote(issuer_name)}"
+        )
+
+
+class pyotp:
+    @staticmethod
+    def random_base32():
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+        return "".join(secrets.choice(alphabet) for _ in range(32))
+
+    @staticmethod
+    def TOTP(secret):
+        return _TOTP(secret)
+
 
 app = Flask(__name__)
+
+
+class SensitiveInvitePathFilter(logging.Filter):
+    def filter(self, record):
+        redacted = re.sub(
+            r"(/api/invites/)[A-Za-z0-9_-]{20,128}",
+            r"\1[redacted]",
+            record.getMessage(),
+            flags=re.IGNORECASE,
+        )
+        record.msg = redacted
+        record.args = ()
+        return True
+
+
+for logger in (app.logger, logging.getLogger("werkzeug")):
+    if not any(
+        isinstance(filter_, SensitiveInvitePathFilter)
+        for filter_ in logger.filters
+    ):
+        logger.addFilter(SensitiveInvitePathFilter())
 
 if not any(
     isinstance(handler, logging.FileHandler)
@@ -159,6 +236,196 @@ def log_failed_login_attempt(email):
     )
 
 
+def _mfa_fernet():
+    key = os.getenv("MFA_ENCRYPTION_KEY", "").strip()
+    if not key:
+        raise RuntimeError("MFA_ENCRYPTION_KEY is not configured.")
+    try:
+        return Fernet(key.encode("ascii"))
+    except (UnicodeEncodeError, ValueError) as error:
+        raise RuntimeError("MFA_ENCRYPTION_KEY is invalid.") from error
+
+
+def _encrypt_mfa_secret(secret):
+    return _mfa_fernet().encrypt(secret.encode("utf-8")).decode("ascii")
+
+
+def _decrypt_mfa_secret(encrypted_secret):
+    try:
+        return _mfa_fernet().decrypt(
+            encrypted_secret.encode("ascii")
+        ).decode("utf-8")
+    except (InvalidToken, UnicodeEncodeError, ValueError) as error:
+        raise RuntimeError("Stored MFA secret could not be decrypted.") from error
+
+
+def _new_session_token(user, purpose="session", minutes=30):
+    return jwt.encode(
+        {
+            "sub": str(user["user_id"]),
+            "role": user["role"],
+            "jti": str(uuid.uuid4()),
+            "sv": int(user.get("session_version") or 0),
+            "purpose": purpose,
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=minutes),
+        },
+        app.config["JWT_SECRET_KEY"],
+        algorithm="HS256"
+    )
+
+
+def _set_auth_cookie(response, name, token, max_age):
+    response.set_cookie(
+        name,
+        token,
+        max_age=max_age,
+        httponly=True,
+        secure=True,
+        samesite="Lax",
+        path="/",
+    )
+
+
+def _clear_auth_cookies(response):
+    response.delete_cookie(
+        "medilink_session", path="/", secure=True, httponly=True,
+        samesite="Lax"
+    )
+    response.delete_cookie(
+        "medilink_mfa_setup", path="/", secure=True, httponly=True,
+        samesite="Lax"
+    )
+
+
+def _new_mfa_setup_token(user):
+    return _new_session_token(user, purpose="mfa_setup", minutes=10)
+
+
+def _consume_recovery_code(cursor, connection, user_id, submitted_code):
+    if not isinstance(submitted_code, str):
+        return False
+    submitted_code = submitted_code.strip()
+    if not submitted_code or len(submitted_code) > 64:
+        return False
+
+    submitted_hash = hashlib.sha256(
+        submitted_code.encode("utf-8")
+    ).hexdigest()
+    cursor.execute(
+        """
+        SELECT recovery_id, code_hash
+        FROM mfa_recovery_codes
+        WHERE user_id = %s AND used_at IS NULL
+        FOR UPDATE
+        """,
+        (user_id,)
+    )
+    for recovery_code in cursor.fetchall():
+        if hmac.compare_digest(
+            submitted_hash, recovery_code["code_hash"]
+        ):
+            cursor.execute(
+                """
+                UPDATE mfa_recovery_codes
+                SET used_at = UTC_TIMESTAMP()
+                WHERE recovery_id = %s AND used_at IS NULL
+                """,
+                (recovery_code["recovery_id"],)
+            )
+            if cursor.rowcount == 1:
+                connection.commit()
+                return True
+    return False
+
+
+def _invite_rate_limit_response():
+    client_ip = request.remote_addr or "unknown"
+    request_key = hashlib.sha256(client_ip.encode("utf-8")).hexdigest()
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            """
+            INSERT INTO invite_rate_limits
+                (request_key, window_started_at, request_count)
+            VALUES (%s, UTC_TIMESTAMP(), 1)
+            ON DUPLICATE KEY UPDATE
+                request_count = IF(
+                    window_started_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 MINUTE),
+                    1,
+                    request_count + 1
+                ),
+                window_started_at = IF(
+                    window_started_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 MINUTE),
+                    UTC_TIMESTAMP(),
+                    window_started_at
+                )
+            """,
+            (request_key,)
+        )
+        connection.commit()
+        cursor.execute(
+            "SELECT request_count FROM invite_rate_limits WHERE request_key = %s",
+            (request_key,)
+        )
+        result = cursor.fetchone()
+        if result and result["request_count"] > 20:
+            return api_error(
+                "Too many invitation requests. Try again later.", 429
+            )
+        return None
+    except Exception:
+        app.logger.exception("Invitation rate-limit check failed")
+        return api_error("Unable to process invitation request", 503)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+def _send_invite_email(email, invite_url):
+    host = os.getenv("SMTP_HOST", "").strip()
+    sender = os.getenv("MAIL_FROM", "").strip()
+    if not host and not sender:
+        return False
+    if not host or not sender:
+        raise RuntimeError("SMTP_HOST and MAIL_FROM must both be configured.")
+
+    username = os.getenv("SMTP_USERNAME", "").strip()
+    password = os.getenv("SMTP_PASSWORD", "")
+    if bool(username) != bool(password):
+        raise RuntimeError(
+            "SMTP_USERNAME and SMTP_PASSWORD must both be configured."
+        )
+
+    message = EmailMessage()
+    message["Subject"] = "Your MediLink Health invitation"
+    message["From"] = sender
+    message["To"] = email
+    message.set_content(
+        "You have been invited to MediLink Health. "
+        "Use this link within 48 hours to set your password and configure MFA:\n"
+        f"{invite_url}\n"
+    )
+
+    port = int(os.getenv("SMTP_PORT", "587"))
+    use_tls = os.getenv("SMTP_USE_TLS", "true").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    with smtplib.SMTP(host, port, timeout=10) as smtp:
+        smtp.ehlo()
+        if use_tls:
+            smtp.starttls()
+            smtp.ehlo()
+        if username:
+            smtp.login(username, password)
+        smtp.send_message(message)
+    return True
+
+
 def write_audit_log(
     actor_user_id,
     action,
@@ -189,7 +456,7 @@ def write_audit_log(
                 target_type,
                 str(target_id) if target_id is not None else None,
                 event_details,
-                request.remote_addr
+                request.remote_addr if has_request_context() else None
             )
         )
         connection.commit()
@@ -242,6 +509,8 @@ def token_required(function):
                 algorithms=["HS256"],
                 options={"require": ["sub", "role", "jti", "exp"]}
             )
+            if payload.get("purpose") not in (None, "session"):
+                return api_error("Invalid authentication token", 401)
 
             # The subject is issued as a string user ID at login.
             try:
@@ -269,7 +538,8 @@ def token_required(function):
 
             cursor.execute(
                 """
-                SELECT user_id, role, account_status
+                SELECT user_id, role, account_status, session_version,
+                       mfa_secret, mfa_confirmed_at, mfa_secret_format
                 FROM users
                 WHERE user_id = %s
                 """,
@@ -285,6 +555,15 @@ def token_required(function):
                     "Your account is inactive. Please contact the administrator.",
                     403
                 )
+            if account["role"] in {"admin", "doctor"} and not (
+                account.get("mfa_secret")
+                and account.get("mfa_confirmed_at") is not None
+                and account.get("mfa_secret_format") == "fernet"
+            ):
+                return api_error(
+                    "MFA setup is required before accessing this account.",
+                    401
+                )
 
             # Do not trust an old role claim if an administrator changed
             # the user's role after the token was issued.
@@ -293,12 +572,19 @@ def token_required(function):
                     "Your account permissions have changed. Please log in again.",
                     401
                 )
+            if int(payload.get("sv") or 0) != int(
+                account.get("session_version") or 0
+            ):
+                return api_error(
+                    "Your session has been revoked. Please log in again.", 401
+                )
 
             request.current_user = {
                 "sub": str(account["user_id"]),
                 "role": account["role"],
                 "jti": payload["jti"],
-                "exp": payload["exp"]
+                "exp": payload["exp"],
+                "session_version": int(account.get("session_version") or 0),
             }
 
         except jwt.ExpiredSignatureError:
@@ -319,6 +605,84 @@ def token_required(function):
     return wrapper
 
 
+def mfa_setup_token_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        auth_header = request.headers.get("Authorization")
+        if auth_header is None:
+            token = request.cookies.get("medilink_mfa_setup", "")
+        elif auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+        else:
+            token = ""
+        if not token:
+            return api_error("MFA setup token is required", 401)
+
+        connection = None
+        cursor = None
+        try:
+            payload = jwt.decode(
+                token,
+                app.config["JWT_SECRET_KEY"],
+                algorithms=["HS256"],
+                options={"require": [
+                    "sub", "role", "jti", "exp", "purpose", "sv"
+                ]}
+            )
+            if payload["purpose"] != "mfa_setup":
+                return api_error("Invalid MFA setup token", 401)
+            try:
+                user_id = int(payload["sub"])
+            except (TypeError, ValueError):
+                return api_error("Invalid MFA setup token", 401)
+
+            connection = get_db_connection()
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT user_id, role, account_status, session_version,
+                       mfa_confirmed_at
+                FROM users
+                WHERE user_id = %s
+                """,
+                (user_id,)
+            )
+            account = cursor.fetchone()
+            if (
+                not account
+                or account["role"] not in {"admin", "doctor"}
+                or account["role"] != payload["role"]
+                or account["account_status"] != "active"
+                or int(account.get("session_version") or 0)
+                    != int(payload["sv"])
+                or account["mfa_confirmed_at"] is not None
+            ):
+                return api_error("Invalid MFA setup token", 401)
+            request.current_user = {
+                "sub": str(account["user_id"]),
+                "role": account["role"],
+                "jti": payload["jti"],
+                "exp": payload["exp"],
+                "session_version": int(account.get("session_version") or 0),
+            }
+        except jwt.ExpiredSignatureError:
+            return api_error("MFA setup token has expired", 401)
+        except jwt.InvalidTokenError:
+            return api_error("Invalid MFA setup token", 401)
+        except Exception:
+            app.logger.exception("MFA setup session verification failed")
+            return api_error("Unable to verify MFA setup session", 503)
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
 @app.after_request
 def add_security_headers(response):
     response.headers["Content-Security-Policy"] = "default-src 'self'"
@@ -326,6 +690,8 @@ def add_security_headers(response):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if request.path.startswith("/api/invites/"):
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -533,6 +899,289 @@ def register_patient():
             connection.close()
 
 
+@app.route("/api/admin/users/invite", methods=["POST"])
+@token_required
+@role_required("admin")
+def admin_invite_user():
+    rate_limit_response = _invite_rate_limit_response()
+    if rate_limit_response:
+        return rate_limit_response
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("A JSON object is required", 400)
+
+    try:
+        full_name = _admin_text(data.get("full_name"), "full_name", 100)
+        email = _admin_text(data.get("email"), "email", 150).lower()
+        role = data.get("role")
+        if role not in {"doctor", "admin"}:
+            raise ValueError("role must be doctor or admin")
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise ValueError("Please enter a valid email address")
+        specialty = None
+        hospital_id = None
+        if role == "doctor":
+            specialty = _admin_text(data.get("specialty"), "specialty", 100)
+            hospital_id = _admin_id(data.get("hospital_id"), "hospital_id")
+    except ValueError as error:
+        return api_error(str(error), 400)
+
+    admin_id = int(request.current_user["sub"])
+    invite_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(invite_token.encode("utf-8")).hexdigest()
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        connection.start_transaction()
+        cursor = connection.cursor()
+        if role == "doctor":
+            cursor.execute(
+                """
+                SELECT hospital_id FROM hospitals
+                WHERE hospital_id = %s AND is_active = TRUE
+                FOR UPDATE
+                """,
+                (hospital_id,)
+            )
+            if not cursor.fetchone():
+                connection.rollback()
+                return api_error("Select an active hospital", 400)
+
+        cursor.execute(
+            """
+            INSERT INTO users
+                (full_name, email, password_hash, role, account_status)
+            VALUES (%s, %s, %s, %s, 'pending')
+            """,
+            (
+                full_name,
+                email,
+                generate_password_hash(secrets.token_urlsafe(48)),
+                role
+            )
+        )
+        user_id = cursor.lastrowid
+        if role == "doctor":
+            cursor.execute(
+                """
+                INSERT INTO doctors
+                    (full_name, specialty, hospital_id, is_active, user_id)
+                VALUES (%s, %s, %s, FALSE, %s)
+                """,
+                (full_name, specialty, hospital_id, user_id)
+            )
+        cursor.execute(
+            """
+            INSERT INTO user_invites
+                (user_id, token_hash, expires_at, created_by)
+            VALUES (
+                %s, %s,
+                DATE_ADD(UTC_TIMESTAMP(), INTERVAL 48 HOUR),
+                %s
+            )
+            """,
+            (user_id, token_hash, admin_id)
+        )
+        connection.commit()
+        write_audit_log(
+            admin_id,
+            "USER_INVITED",
+            "user",
+            user_id,
+            f"Invited a {role} account."
+        )
+    except IntegrityError:
+        if connection:
+            connection.rollback()
+        return api_error("That email address is already in use", 409)
+    except Exception:
+        if connection:
+            connection.rollback()
+        app.logger.exception("Administrator could not invite a user")
+        return api_error("Unable to create invitation", 500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+    frontend_url = os.getenv(
+        "FRONTEND_URL", "http://localhost:5173"
+    ).strip().rstrip("/")
+    invite_url = f"{frontend_url}/invite/{invite_token}"
+    email_sent = False
+    email_warning = None
+    try:
+        email_sent = _send_invite_email(email, invite_url)
+    except (OSError, RuntimeError, smtplib.SMTPException, ValueError):
+        app.logger.error("Invitation email delivery failed.")
+        email_warning = (
+            "Email delivery failed. Share the returned invitation link securely."
+        )
+
+    response = jsonify({
+        "status": "success",
+        "message": "Invitation created",
+        "invite_url": invite_url,
+        "email_sent": email_sent,
+        "email_warning": email_warning,
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response, 201
+
+
+@app.route("/api/invites/<token>", methods=["GET"])
+def get_invite(token):
+    rate_limit_response = _invite_rate_limit_response()
+    if rate_limit_response:
+        return rate_limit_response
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", token):
+        return api_error("Invalid or expired invitation", 400)
+
+    connection = None
+    cursor = None
+    try:
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT u.full_name, u.email, u.role
+            FROM user_invites i
+            INNER JOIN users u ON u.user_id = i.user_id
+            WHERE i.token_hash = %s
+              AND i.used_at IS NULL
+              AND i.expires_at > UTC_TIMESTAMP()
+              AND u.account_status = 'pending'
+            """,
+            (token_hash,)
+        )
+        invite = cursor.fetchone()
+        if not invite:
+            return api_error("Invalid or expired invitation", 400)
+        response = jsonify({"status": "success", "invite": invite})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 200
+    except Exception:
+        app.logger.exception("Invitation lookup failed")
+        return api_error("Unable to validate invitation", 503)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+@app.route("/api/invites/<token>/accept", methods=["POST"])
+def accept_invite(token):
+    rate_limit_response = _invite_rate_limit_response()
+    if rate_limit_response:
+        return rate_limit_response
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", token):
+        return api_error("Invalid or expired invitation", 400)
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("A JSON object is required", 400)
+    password = data.get("password")
+    if not isinstance(password, str) or not 8 <= len(password) <= 128:
+        return api_error("Password must be between 8 and 128 characters", 400)
+
+    connection = None
+    cursor = None
+    try:
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        connection = get_db_connection()
+        connection.start_transaction()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT i.invite_id, i.user_id, u.full_name, u.email, u.role,
+                   u.account_status, u.session_version
+            FROM user_invites i
+            INNER JOIN users u ON u.user_id = i.user_id
+            WHERE i.token_hash = %s
+              AND i.used_at IS NULL
+              AND i.expires_at > UTC_TIMESTAMP()
+              AND u.account_status = 'pending'
+            FOR UPDATE
+            """,
+            (token_hash,)
+        )
+        invite = cursor.fetchone()
+        if not invite:
+            connection.rollback()
+            return api_error("Invalid or expired invitation", 400)
+
+        cursor.execute(
+            """
+            UPDATE users
+            SET password_hash = %s, account_status = 'active',
+                status_changed_at = CURRENT_TIMESTAMP
+            WHERE user_id = %s AND account_status = 'pending'
+            """,
+            (generate_password_hash(password), invite["user_id"])
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return api_error("Invalid or expired invitation", 400)
+        if invite["role"] == "doctor":
+            cursor.execute(
+                "UPDATE doctors SET is_active = TRUE WHERE user_id = %s",
+                (invite["user_id"],)
+            )
+        cursor.execute(
+            """
+            UPDATE user_invites
+            SET used_at = UTC_TIMESTAMP()
+            WHERE invite_id = %s AND used_at IS NULL
+            """,
+            (invite["invite_id"],)
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return api_error("Invalid or expired invitation", 400)
+        connection.commit()
+        write_audit_log(
+            invite["user_id"],
+            "INVITATION_ACCEPTED",
+            "user",
+            invite["user_id"],
+            "Invited account activated; MFA setup is required."
+        )
+
+        response = jsonify({
+            "status": "mfa_setup_required",
+            "user": {
+                "user_id": invite["user_id"],
+                "full_name": invite["full_name"],
+                "email": invite["email"],
+                "role": invite["role"],
+            },
+        })
+        _clear_auth_cookies(response)
+        _set_auth_cookie(
+            response,
+            "medilink_mfa_setup",
+            _new_mfa_setup_token(invite),
+            10 * 60
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response, 200
+    except Exception:
+        if connection:
+            connection.rollback()
+        app.logger.exception("Invitation acceptance failed")
+        return api_error("Unable to accept invitation", 500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
 @app.route("/api/login", methods=["POST"])
 def login_patient():
     data = request.get_json(silent=True)
@@ -582,7 +1231,8 @@ def login_patient():
         cursor.execute(
             """
             SELECT user_id, full_name, email, password_hash,
-                   role, account_status, mfa_secret
+                   role, account_status, mfa_secret, mfa_confirmed_at,
+                   mfa_secret_format, session_version
             FROM users
             WHERE email = %s
             """,
@@ -607,23 +1257,71 @@ def login_patient():
                 403
             )
 
-        mfa_secret = user.get("mfa_secret")
-        if (
-            user["role"] in {"admin", "doctor"}
-            and mfa_secret is not None
-        ):
+        if user["role"] in {"admin", "doctor"}:
+            mfa_is_confirmed = (
+                user.get("mfa_secret")
+                and user.get("mfa_confirmed_at") is not None
+                and user.get("mfa_secret_format") == "fernet"
+            )
+            if not mfa_is_confirmed:
+                try:
+                    _mfa_fernet()
+                except RuntimeError:
+                    return api_error(
+                        "MFA setup is unavailable. Contact the administrator.",
+                        503
+                    )
+                response = jsonify({
+                    "status": "mfa_setup_required",
+                    "user": {
+                        "user_id": user["user_id"],
+                        "full_name": user["full_name"],
+                        "email": user["email"],
+                        "role": user["role"],
+                    },
+                })
+                _clear_auth_cookies(response)
+                _set_auth_cookie(
+                    response,
+                    "medilink_mfa_setup",
+                    _new_mfa_setup_token(user),
+                    10 * 60
+                )
+                response.headers["Cache-Control"] = "no-store"
+                return response, 200
+
             totp_code = data.get("totp_code")
+            recovery_code = data.get("recovery_code")
+            if not totp_code and not recovery_code:
+                response = jsonify({
+                    "status": "mfa_required",
+                    "message": "Enter your authenticator or recovery code.",
+                })
+                _clear_auth_cookies(response)
+                response.headers["Cache-Control"] = "no-store"
+                return response, 200
+
+            valid_mfa = False
             try:
-                valid_totp = (
-                    isinstance(totp_code, str)
-                    and pyotp.TOTP(mfa_secret).verify(
+                secret = _decrypt_mfa_secret(user["mfa_secret"])
+                if isinstance(totp_code, str) and totp_code:
+                    valid_mfa = pyotp.TOTP(secret).verify(
                         totp_code.strip(), valid_window=1
                     )
+                elif isinstance(recovery_code, str) and recovery_code:
+                    valid_mfa = _consume_recovery_code(
+                        cursor, connection, user["user_id"], recovery_code
+                    )
+            except RuntimeError:
+                app.logger.error("MFA secret could not be used for login.")
+                return api_error(
+                    "MFA verification is unavailable. Contact the administrator.",
+                    503
                 )
             except (TypeError, ValueError):
-                valid_totp = False
+                valid_mfa = False
 
-            if not valid_totp:
+            if not valid_mfa:
                 record_failed_login(cursor, connection, email)
                 log_failed_login_attempt(email)
                 return api_error("Invalid email or password", 401)
@@ -638,16 +1336,7 @@ def login_patient():
         )
         connection.commit()
 
-        token = jwt.encode(
-            {
-                "sub": str(user["user_id"]),
-                "role": user["role"],
-                "jti": str(uuid.uuid4()),
-                "exp": datetime.now(timezone.utc) + timedelta(minutes=30)
-            },
-            app.config["JWT_SECRET_KEY"],
-            algorithm="HS256"
-        )
+        token = _new_session_token(user)
 
         write_audit_log(
             user["user_id"], "LOGIN_SUCCESS", "user", user["user_id"],
@@ -664,14 +1353,11 @@ def login_patient():
                 "role": user["role"]
             }
         })
-        response.set_cookie(
-            "medilink_session",
-            token,
-            max_age=30 * 60,
-            httponly=True,
-            secure=True,
+        response.delete_cookie(
+            "medilink_mfa_setup", path="/", secure=True, httponly=True,
             samesite="Lax"
         )
+        _set_auth_cookie(response, "medilink_session", token, 30 * 60)
         return response, 200
 
     except Exception:
@@ -685,8 +1371,7 @@ def login_patient():
 
 
 @app.route("/api/mfa/enroll", methods=["POST"])
-@token_required
-@role_required("admin", "doctor")
+@mfa_setup_token_required
 def enroll_mfa():
     connection = None
     cursor = None
@@ -698,7 +1383,8 @@ def enroll_mfa():
         user_id = int(request.current_user["sub"])
         cursor.execute(
             """
-            SELECT email, mfa_secret
+            SELECT email, mfa_secret, mfa_secret_format,
+                   mfa_confirmed_at
             FROM users
             WHERE user_id = %s
             FOR UPDATE
@@ -710,47 +1396,167 @@ def enroll_mfa():
             connection.rollback()
             return api_error("Account not found", 404)
 
-        if user["mfa_secret"] is not None:
+        if user["mfa_confirmed_at"] is not None:
             connection.rollback()
             return api_error("MFA is already enrolled", 409)
 
-        secret = pyotp.random_base32()
+        if (
+            user["mfa_secret"]
+            and user["mfa_secret_format"] == "fernet"
+        ):
+            secret = _decrypt_mfa_secret(user["mfa_secret"])
+        else:
+            secret = pyotp.random_base32()
+            encrypted_secret = _encrypt_mfa_secret(secret)
+            cursor.execute(
+                """
+                UPDATE users
+                SET mfa_secret = %s, mfa_secret_format = 'fernet'
+                WHERE user_id = %s AND mfa_confirmed_at IS NULL
+                """,
+                (encrypted_secret, user_id)
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return api_error("MFA setup could not be started", 409)
+
         provisioning_uri = pyotp.TOTP(secret).provisioning_uri(
             name=user["email"],
             issuer_name="MediLink Health"
         )
-        cursor.execute(
-            """
-            UPDATE users
-            SET mfa_secret = %s
-            WHERE user_id = %s AND mfa_secret IS NULL
-            """,
-            (secret, user_id)
-        )
-        if cursor.rowcount != 1:
-            connection.rollback()
-            return api_error("MFA is already enrolled", 409)
 
         connection.commit()
-        write_audit_log(
-            user_id,
-            "MFA_ENROLL",
-            "user",
-            user_id,
-            "Authenticator-app MFA enrolled."
-        )
-
         response = jsonify({
             "status": "success",
-            "provisioning_uri": provisioning_uri
+            "provisioning_uri": provisioning_uri,
+            "manual_key": secret,
         })
         response.headers["Cache-Control"] = "no-store"
         return response, 200
+    except RuntimeError:
+        if connection:
+            connection.rollback()
+        app.logger.error("MFA encryption is unavailable during setup.")
+        return api_error("MFA setup is unavailable. Contact the administrator.", 503)
     except Exception:
         if connection:
             connection.rollback()
-        app.logger.error("MFA enrollment failed")
+        app.logger.exception("MFA enrollment failed")
         return api_error("Unable to enroll in MFA", 500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+@app.route("/api/mfa/confirm", methods=["POST"])
+@mfa_setup_token_required
+def confirm_mfa():
+    data = request.get_json(silent=True)
+    code = data.get("totp_code") if isinstance(data, dict) else None
+    if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code):
+        return api_error("Enter a valid six-digit authenticator code", 400)
+
+    connection = None
+    cursor = None
+    try:
+        user_id = int(request.current_user["sub"])
+        connection = get_db_connection()
+        connection.start_transaction()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT user_id, full_name, email, role, session_version,
+                   mfa_secret, mfa_secret_format, mfa_confirmed_at
+            FROM users
+            WHERE user_id = %s
+            FOR UPDATE
+            """,
+            (user_id,)
+        )
+        user = cursor.fetchone()
+        if (
+            not user
+            or user["mfa_confirmed_at"] is not None
+            or not user["mfa_secret"]
+            or user["mfa_secret_format"] != "fernet"
+        ):
+            connection.rollback()
+            return api_error("MFA setup is unavailable", 409)
+
+        secret = _decrypt_mfa_secret(user["mfa_secret"])
+        if not pyotp.TOTP(secret).verify(code, valid_window=1):
+            connection.rollback()
+            return api_error("Authenticator code is invalid", 400)
+
+        recovery_codes = [secrets.token_hex(8).upper() for _ in range(10)]
+        for recovery_code in recovery_codes:
+            code_hash = hashlib.sha256(
+                recovery_code.encode("utf-8")
+            ).hexdigest()
+            cursor.execute(
+                """
+                INSERT INTO mfa_recovery_codes (user_id, code_hash)
+                VALUES (%s, %s)
+                """,
+                (user_id, code_hash)
+            )
+        cursor.execute(
+            """
+            UPDATE users
+            SET mfa_confirmed_at = UTC_TIMESTAMP()
+            WHERE user_id = %s AND mfa_confirmed_at IS NULL
+            """,
+            (user_id,)
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return api_error("MFA setup is unavailable", 409)
+        connection.commit()
+
+        write_audit_log(
+            user_id,
+            "MFA_CONFIRMED",
+            "user",
+            user_id,
+            "Authenticator-app MFA was confirmed."
+        )
+        response = jsonify({
+            "status": "success",
+            "user": {
+                "user_id": user["user_id"],
+                "full_name": user["full_name"],
+                "email": user["email"],
+                "role": user["role"],
+            },
+            "recovery_codes": recovery_codes,
+        })
+        response.delete_cookie(
+            "medilink_mfa_setup", path="/", secure=True, httponly=True,
+            samesite="Lax"
+        )
+        _set_auth_cookie(
+            response,
+            "medilink_session",
+            _new_session_token(user),
+            30 * 60
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response, 200
+    except RuntimeError:
+        if connection:
+            connection.rollback()
+        app.logger.error("MFA encryption is unavailable during confirmation.")
+        return api_error(
+            "MFA confirmation is unavailable. Contact the administrator.",
+            503
+        )
+    except Exception:
+        if connection:
+            connection.rollback()
+        app.logger.exception("MFA confirmation failed")
+        return api_error("Unable to confirm MFA setup", 500)
     finally:
         if cursor:
             cursor.close()
@@ -761,6 +1567,121 @@ def enroll_mfa():
 # ---------------------------------------------------------------------------
 # Logout and patient profile
 # ---------------------------------------------------------------------------
+
+@app.route("/api/me", methods=["GET"])
+@token_required
+def current_user():
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT user_id, full_name, email, role, account_status,
+                   mfa_confirmed_at
+            FROM users
+            WHERE user_id = %s
+            """,
+            (int(request.current_user["sub"]),)
+        )
+        user = cursor.fetchone()
+        if not user:
+            return api_error("Account not found", 401)
+        return jsonify({"status": "success", "user": user}), 200
+    except Exception:
+        app.logger.exception("Current-user lookup failed")
+        return api_error("Unable to retrieve current user", 500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+@app.route("/api/doctor/profile", methods=["GET"])
+@token_required
+@role_required("doctor")
+def doctor_profile():
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT u.user_id, u.full_name, u.email, d.doctor_id,
+                   d.specialty, d.hospital_id, d.is_active,
+                   h.hospital_name, h.city AS hospital_city
+            FROM users u
+            INNER JOIN doctors d ON d.user_id = u.user_id
+            LEFT JOIN hospitals h ON h.hospital_id = d.hospital_id
+            WHERE u.user_id = %s AND u.account_status = 'active'
+            """,
+            (int(request.current_user["sub"]),)
+        )
+        profile = cursor.fetchone()
+        if not profile:
+            return api_error("Doctor profile is unavailable", 404)
+        return jsonify({"status": "success", "profile": profile}), 200
+    except Exception:
+        app.logger.exception("Unable to retrieve doctor profile")
+        return api_error("Unable to retrieve doctor profile", 500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+@app.route("/api/doctor/appointments", methods=["GET"])
+@token_required
+@role_required("doctor")
+def doctor_appointments():
+    connection = None
+    cursor = None
+    try:
+        limit = _admin_limit()
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT a.appointment_id, a.appointment_date, a.reason, a.status,
+                   p.full_name AS patient_name,
+                   h.hospital_name, h.city AS hospital_city
+            FROM appointments a
+            INNER JOIN doctors d ON d.doctor_id = a.doctor_id
+            INNER JOIN users p ON p.user_id = a.patient_id
+            LEFT JOIN hospitals h ON h.hospital_id = d.hospital_id
+            WHERE d.user_id = %s
+            ORDER BY a.appointment_date DESC
+            LIMIT %s
+            """,
+            (int(request.current_user["sub"]), limit)
+        )
+        appointments = cursor.fetchall()
+        write_audit_log(
+            int(request.current_user["sub"]),
+            "DOCTOR_APPOINTMENTS_VIEWED",
+            "user",
+            int(request.current_user["sub"]),
+            f"Viewed {len(appointments)} assigned appointments."
+        )
+        return jsonify({
+            "status": "success",
+            "appointments": appointments,
+        }), 200
+    except ValueError as error:
+        return api_error(str(error), 400)
+    except Exception:
+        app.logger.exception("Unable to retrieve doctor appointments")
+        return api_error("Unable to retrieve doctor appointments", 500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
 
 @app.route("/api/logout", methods=["POST"])
 @token_required
@@ -793,12 +1714,7 @@ def logout_patient():
             "status": "success",
             "message": "Logged out successfully"
         })
-        response.delete_cookie(
-            "medilink_session",
-            httponly=True,
-            secure=True,
-            samesite="Lax"
-        )
+        _clear_auth_cookies(response)
         return response, 200
     except Exception:
         if connection:
@@ -1321,7 +2237,9 @@ def admin_list_users():
         status_filter = request.args.get("status", "").strip().lower()
         if role_filter not in {"", "patient", "doctor", "admin"}:
             return api_error("role is invalid", 400)
-        if status_filter not in {"", "active", "suspended", "deactivated"}:
+        if status_filter not in {
+            "", "pending", "active", "suspended", "deactivated"
+        }:
             return api_error("status is invalid", 400)
 
         conditions = []
@@ -1346,7 +2264,14 @@ def admin_list_users():
             f"""
             SELECT
                 user_id, full_name, email, role,
-                account_status, created_at, status_changed_at
+                account_status, created_at, status_changed_at,
+                CASE
+                    WHEN role IN ('admin', 'doctor')
+                     AND mfa_secret IS NOT NULL
+                     AND mfa_confirmed_at IS NOT NULL
+                     AND mfa_secret_format = 'fernet'
+                    THEN TRUE ELSE FALSE
+                END AS mfa_enabled
             FROM users
             WHERE {where_sql}
             ORDER BY user_id
@@ -1401,6 +2326,13 @@ def _set_admin_user_status(user_id, new_status, admin_id, soft_delete=False):
         if not target:
             connection.rollback()
             return api_error("User not found", 404)
+
+        if target["account_status"] == "pending" and new_status == "active":
+            connection.rollback()
+            return api_error(
+                "Pending invitations must be accepted before activation.",
+                409
+            )
 
         if target["role"] == "admin" and target["account_status"] == "active" \
                 and new_status != "active":
@@ -1478,6 +2410,86 @@ def admin_update_user_status(user_id):
 
     admin_id = int(request.current_user["sub"])
     return _set_admin_user_status(user_id, new_status, admin_id)
+
+
+@app.route("/api/admin/users/<int:user_id>/mfa/reset", methods=["POST"])
+@token_required
+@role_required("admin")
+def admin_reset_user_mfa(user_id):
+    admin_id = int(request.current_user["sub"])
+    if user_id == admin_id:
+        return api_error("You cannot reset MFA on your own account", 400)
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("A JSON object is required", 400)
+    try:
+        reason = _admin_text(data.get("reason"), "reason", 500)
+        if len(reason) < 8:
+            raise ValueError("reason must be at least 8 characters")
+    except ValueError as error:
+        return api_error(str(error), 400)
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        connection.start_transaction()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT user_id, role
+            FROM users
+            WHERE user_id = %s
+            FOR UPDATE
+            """,
+            (user_id,)
+        )
+        target = cursor.fetchone()
+        if not target:
+            connection.rollback()
+            return api_error("User not found", 404)
+        if target["role"] not in {"admin", "doctor"}:
+            connection.rollback()
+            return api_error("MFA is only available for staff accounts", 400)
+
+        cursor.execute(
+            """
+            UPDATE users
+            SET mfa_secret = NULL,
+                mfa_confirmed_at = NULL,
+                mfa_secret_format = 'fernet',
+                session_version = session_version + 1
+            WHERE user_id = %s
+            """,
+            (user_id,)
+        )
+        cursor.execute(
+            "DELETE FROM mfa_recovery_codes WHERE user_id = %s",
+            (user_id,)
+        )
+        connection.commit()
+        write_audit_log(
+            admin_id,
+            "MFA_RESET",
+            "user",
+            user_id,
+            f"Administrator reset MFA. Reason: {reason}"
+        )
+        return jsonify({
+            "status": "success",
+            "message": "MFA reset; the user must enroll again.",
+        }), 200
+    except Exception:
+        if connection:
+            connection.rollback()
+        app.logger.exception("Administrator MFA reset failed")
+        return api_error("Unable to reset MFA", 500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 @app.route("/api/admin/users/<int:user_id>", methods=["DELETE"])

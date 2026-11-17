@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import logo from "../../medilink-health-transparent (1).png";
-import { API_BASE_URL } from "../config";
+import { apiFetch } from "../api";
 import "./login.css";
 
 function Login() {
@@ -10,6 +10,9 @@ function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [totpCode, setTotpCode] = useState("");
+  const [recoveryCode, setRecoveryCode] = useState("");
+  const [step, setStep] = useState("credentials");
+  const [useRecoveryCode, setUseRecoveryCode] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -19,18 +22,34 @@ function Login() {
     setLoading(true);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/login`, {
+      const response = await apiFetch("/api/login", {
         method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           email,
           password,
-          ...(totpCode ? { totp_code: totpCode } : {}),
+          ...(step === "mfa" && !useRecoveryCode && totpCode
+            ? { totp_code: totpCode }
+            : {}),
+          ...(step === "mfa" && useRecoveryCode && recoveryCode
+            ? { recovery_code: recoveryCode }
+            : {}),
         }),
       });
 
       const data = await response.json();
+
+      if (response.ok && data.status === "mfa_required") {
+        setStep("mfa");
+        setTotpCode("");
+        setRecoveryCode("");
+        return;
+      }
+
+      if (response.ok && data.status === "mfa_setup_required") {
+        sessionStorage.setItem("user", JSON.stringify(data.user));
+        navigate("/mfa-setup");
+        return;
+      }
 
       if (!response.ok) {
         setError(data.message || data.error || "Invalid email or password.");
@@ -92,6 +111,7 @@ function Login() {
                 onChange={(e) => setEmail(e.target.value)}
                 autoComplete="email"
                 required
+                disabled={step === "mfa"}
               />
             </div>
 
@@ -105,29 +125,78 @@ function Login() {
                 onChange={(e) => setPassword(e.target.value)}
                 autoComplete="current-password"
                 required
+                disabled={step === "mfa"}
               />
             </div>
 
-            <div className="login-field">
-              <label htmlFor="totp-code">Authenticator Code (if enabled)</label>
-              <input
-                id="totp-code"
-                type="text"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                maxLength={6}
-                placeholder="Enter your 6-digit code"
-                value={totpCode}
-                onChange={(e) => setTotpCode(
-                  e.target.value.replace(/\D/g, "").slice(0, 6)
-                )}
-              />
-            </div>
+            {step === "mfa" && (
+              <>
+                <div className="login-field">
+                  <label htmlFor="mfa-code">
+                    {useRecoveryCode ? "Recovery Code" : "Authenticator Code"}
+                  </label>
+                  <input
+                    id="mfa-code"
+                    type="text"
+                    inputMode={useRecoveryCode ? "text" : "numeric"}
+                    autoComplete="one-time-code"
+                    maxLength={useRecoveryCode ? 64 : 6}
+                    placeholder={
+                      useRecoveryCode
+                        ? "Enter one unused recovery code"
+                        : "Enter your 6-digit code"
+                    }
+                    value={useRecoveryCode ? recoveryCode : totpCode}
+                    onChange={(event) => {
+                      if (useRecoveryCode) {
+                        setRecoveryCode(event.target.value);
+                      } else {
+                        setTotpCode(
+                          event.target.value.replace(/\D/g, "").slice(0, 6)
+                        );
+                      }
+                    }}
+                    required
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="login-secondary-button"
+                  onClick={() => {
+                    setUseRecoveryCode(!useRecoveryCode);
+                    setTotpCode("");
+                    setRecoveryCode("");
+                    setError("");
+                  }}
+                >
+                  {useRecoveryCode
+                    ? "Use authenticator code instead"
+                    : "Use a recovery code"}
+                </button>
+                <button
+                  type="button"
+                  className="login-secondary-button"
+                  onClick={() => {
+                    setStep("credentials");
+                    setUseRecoveryCode(false);
+                    setTotpCode("");
+                    setRecoveryCode("");
+                    setError("");
+                  }}
+                >
+                  Back to sign in
+                </button>
+              </>
+            )}
 
             {error && <div className="login-error">{error}</div>}
 
             <button type="submit" className="login-button" disabled={loading}>
-              {loading ? "Signing In..." : "Sign In"}
+              {loading
+                ? "Verifying..."
+                : step === "mfa"
+                  ? "Verify and Sign In"
+                  : "Sign In"}
               {!loading && <span>→</span>}
             </button>
           </form>

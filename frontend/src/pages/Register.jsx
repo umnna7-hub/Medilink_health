@@ -1,7 +1,7 @@
 
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { API_BASE_URL } from "../config";
+import { apiFetch } from "../api";
 import "./Auth.css";
 
 function Register() {
@@ -32,11 +32,8 @@ const [showConfirmPassword, setShowConfirmPassword] = useState(false);
     setLoading(true);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/register`, {
+      const response = await apiFetch("/api/register", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
         body: JSON.stringify({
           full_name: fullName,
           email,
@@ -68,6 +65,9 @@ const [showConfirmPassword, setShowConfirmPassword] = useState(false);
           <span className="auth-icon">✚</span>
           <h1>Create Account</h1>
           <p>Join MediLink Health and manage your healthcare.</p>
+          <p className="registration-note">
+            Doctors and staff receive an invitation from an administrator.
+          </p>
         </div>
 
         <form onSubmit={handleRegister}>

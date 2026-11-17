@@ -11,6 +11,8 @@ GRANT SELECT, INSERT, UPDATE ON medilink_health.hospitals
     TO 'medilink_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON medilink_health.login_attempts
     TO 'medilink_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON medilink_health.invite_rate_limits
+    TO 'medilink_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON medilink_health.lab_reports
     TO 'medilink_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON medilink_health.medical_records
@@ -20,6 +22,10 @@ GRANT SELECT, INSERT, UPDATE ON medilink_health.payments
 GRANT SELECT, INSERT, UPDATE ON medilink_health.revoked_tokens
     TO 'medilink_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON medilink_health.users
+    TO 'medilink_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON medilink_health.user_invites
+    TO 'medilink_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON medilink_health.mfa_recovery_codes
     TO 'medilink_app'@'localhost';
 
 GRANT SELECT, INSERT ON medilink_health.audit_logs

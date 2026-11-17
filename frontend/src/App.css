@@ -596,3 +596,18 @@ small,
 nav {
   font-family: Arial, Helvetica, sans-serif;
 }
+.not-found-page {
+  min-height: 100vh;
+  padding: 48px 24px;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  color: #193b58;
+  text-align: center;
+  font-family: Arial, sans-serif;
+}
+
+.not-found-page a {
+  color: #bb3b0e;
+  font-weight: 700;
+}

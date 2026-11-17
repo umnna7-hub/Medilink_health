@@ -1,15 +1,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { API_BASE_URL } from "../config";
+import { apiFetch as requestApi } from "../api";
 import "./Dashboard.css";
 
-const API = `${API_BASE_URL}/api`;
-
-const apiFetch = (path, options = {}) => fetch(`${API}${path}`, {
-  ...options,
-  credentials: "include",
-});
+const apiFetch = (path, options = {}) => requestApi(`/api${path}`, options);
 
 function formatDate(value, includeTime = false) {
   if (!value) return "Not available";
@@ -83,7 +78,7 @@ function PatientDashboard() {
   const [laboratoriesError, setLaboratoriesError] = useState("");
 
   const logoutLocally = useCallback(() => {
-    sessionStorage.removeItem("user");
+    sessionStorage.clear();
     navigate("/login");
   }, [navigate]);
 
@@ -501,10 +496,10 @@ function PatientDashboard() {
       if (!response.ok) {
         throw new Error("Secure logout failed. Please try again.");
       }
-
-      logoutLocally();
     } catch (error) {
       window.alert(error.message || "Unable to complete secure logout.");
+    } finally {
+      logoutLocally();
     }
   };
 

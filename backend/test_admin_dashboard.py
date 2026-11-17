@@ -97,9 +97,23 @@ class AdminDashboardRouteTests(unittest.TestCase):
     def setUp(self):
         self.state = {
             "users": {
-                7: {"user_id": 7, "role": "admin", "account_status": "active"},
-                8: {"user_id": 8, "role": "admin", "account_status": "active"},
-                9: {"user_id": 9, "role": "patient", "account_status": "active"},
+                7: {
+                    "user_id": 7, "role": "admin", "account_status": "active",
+                    "session_version": 0, "mfa_secret": "encrypted",
+                    "mfa_confirmed_at": "confirmed",
+                    "mfa_secret_format": "fernet",
+                },
+                8: {
+                    "user_id": 8, "role": "admin", "account_status": "active",
+                    "session_version": 0, "mfa_secret": "encrypted",
+                    "mfa_confirmed_at": "confirmed",
+                    "mfa_secret_format": "fernet",
+                },
+                9: {
+                    "user_id": 9, "role": "patient", "account_status": "active",
+                    "session_version": 0, "mfa_secret": None,
+                    "mfa_confirmed_at": None, "mfa_secret_format": "fernet",
+                },
             },
             "admins": [
                 {"user_id": 7, "account_status": "active"},

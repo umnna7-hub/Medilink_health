@@ -1,12 +1,48 @@
+import base64
+import hashlib
+import hmac
+import os
+import secrets
+import struct
+import sys
 import time
 import unittest
+from datetime import datetime, timezone
+from types import ModuleType
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 import jwt
-import pyotp
+try:
+    import pyotp  # pyright: ignore[reportMissingImports]
+except ImportError:
+    class _FallbackTotp:
+        def __init__(self, secret):
+            self.secret = secret
+
+        def now(self):
+            key = base64.b32decode(self.secret + "=" * (-len(self.secret) % 8))
+            counter = int(time.time()) // 30
+            digest = hmac.new(
+                key,
+                struct.pack(">Q", counter),
+                hashlib.sha1,
+            ).digest()
+            offset = digest[-1] & 0x0F
+            value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+            return f"{value % 1000000:06d}"
+
+    pyotp = ModuleType("pyotp")
+    pyotp.random_base32 = lambda: base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+    pyotp.TOTP = _FallbackTotp
+    sys.modules["pyotp"] = pyotp
+from cryptography.fernet import Fernet
 
 import app as backend
+
+
+def utcnow_naive():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class MfaCursor:
@@ -38,7 +74,7 @@ class MfaCursor:
             return
 
         if normalized.startswith(
-            "SELECT user_id, role, account_status FROM users"
+            "SELECT user_id, role, account_status, session_version"
         ):
             user = self.state["users_by_id"].get(params[0])
             self.result = (
@@ -46,26 +82,36 @@ class MfaCursor:
                     "user_id": user["user_id"],
                     "role": user["role"],
                     "account_status": user["account_status"],
+                    "session_version": user["session_version"],
+                    "mfa_confirmed_at": user["mfa_confirmed_at"],
+                    "mfa_secret": user["mfa_secret"],
+                    "mfa_secret_format": user["mfa_secret_format"],
+                }
+                if user else None
+            )
+            return
+
+        if normalized.startswith("SELECT email, mfa_secret"):
+            user = self.state["users_by_id"].get(params[0])
+            self.result = (
+                {
+                    "email": user["email"],
+                    "mfa_secret": user["mfa_secret"],
+                    "mfa_secret_format": user["mfa_secret_format"],
+                    "mfa_confirmed_at": user["mfa_confirmed_at"],
                 }
                 if user else None
             )
             return
 
         if normalized.startswith(
-            "SELECT email, mfa_secret FROM users"
+            "UPDATE users SET mfa_secret = %s, mfa_secret_format = 'fernet'"
         ):
-            user = self.state["users_by_id"].get(params[0])
-            self.result = (
-                {"email": user["email"], "mfa_secret": user["mfa_secret"]}
-                if user else None
-            )
-            return
-
-        if normalized.startswith("UPDATE users SET mfa_secret"):
             secret, user_id = params
             user = self.state["users_by_id"].get(user_id)
-            if user and user["mfa_secret"] is None:
+            if user and user["mfa_confirmed_at"] is None:
                 user["mfa_secret"] = secret
+                user["mfa_secret_format"] = "fernet"
                 self.rowcount = 1
             return
 
@@ -95,6 +141,9 @@ class MfaCursor:
 
     def fetchone(self):
         return self.result
+
+    def fetchall(self):
+        return []
 
     def close(self):
         pass
@@ -130,6 +179,9 @@ class MfaRouteTests(unittest.TestCase):
             "role": "admin",
             "account_status": "active",
             "mfa_secret": None,
+            "mfa_secret_format": "fernet",
+            "mfa_confirmed_at": None,
+            "session_version": 0,
         }
         self.state = {
             "users_by_id": {user["user_id"]: user},
@@ -152,6 +204,11 @@ class MfaRouteTests(unittest.TestCase):
             ),
         )
         self.audit_patch = patch.object(backend, "write_audit_log")
+        self.encryption_key = Fernet.generate_key().decode("ascii")
+        self.encryption_patch = patch.dict(
+            os.environ, {"MFA_ENCRYPTION_KEY": self.encryption_key}
+        )
+        self.encryption_patch.start()
         self.db_patch.start()
         self.password_patch.start()
         self.audit_patch.start()
@@ -160,20 +217,26 @@ class MfaRouteTests(unittest.TestCase):
         self.db_patch.stop()
         self.password_patch.stop()
         self.audit_patch.stop()
+        self.encryption_patch.stop()
         backend.app.config["TESTING"] = self.original_testing
 
-    def authorization_headers(self, role=None):
+    def authorization_headers(self, role=None, purpose="session"):
         token = jwt.encode(
             {
                 "sub": "7",
                 "role": role or self.state["users_by_id"][7]["role"],
                 "jti": "mfa-test-session",
+                "sv": 0,
+                "purpose": purpose,
                 "exp": int(time.time()) + 60,
             },
             backend.app.config["JWT_SECRET_KEY"],
             algorithm="HS256",
         )
         return {"Authorization": f"Bearer {token}"}
+
+    def setup_headers(self, role=None):
+        return self.authorization_headers(role, purpose="mfa_setup")
 
     def login(self, password="correct-password", **fields):
         return self.client.post(
@@ -188,12 +251,15 @@ class MfaRouteTests(unittest.TestCase):
     def enable_mfa(self, role="admin"):
         user = self.state["users_by_id"][7]
         user["role"] = role
-        user["mfa_secret"] = pyotp.random_base32()
-        return user["mfa_secret"]
+        secret = pyotp.random_base32()
+        user["mfa_secret"] = backend._encrypt_mfa_secret(secret)
+        user["mfa_secret_format"] = "fernet"
+        user["mfa_confirmed_at"] = utcnow_naive()
+        return secret
 
-    def test_enrollment_returns_uncached_provisioning_uri_and_is_one_time(self):
+    def test_enrollment_returns_uncached_uri_and_encrypted_secret(self):
         response = self.client.post(
-            "/api/mfa/enroll", headers=self.authorization_headers()
+            "/api/mfa/enroll", headers=self.setup_headers()
         )
 
         self.assertEqual(response.status_code, 200)
@@ -202,15 +268,21 @@ class MfaRouteTests(unittest.TestCase):
         self.assertTrue(uri.startswith("otpauth://totp/"))
         returned_secret = parse_qs(urlparse(uri).query)["secret"][0]
         self.assertEqual(
-            self.state["users_by_id"][7]["mfa_secret"], returned_secret
+            backend._decrypt_mfa_secret(
+                self.state["users_by_id"][7]["mfa_secret"]
+            ),
+            returned_secret
         )
 
         second_response = self.client.post(
-            "/api/mfa/enroll", headers=self.authorization_headers()
+            "/api/mfa/enroll", headers=self.setup_headers()
         )
-        self.assertEqual(second_response.status_code, 409)
+        self.assertEqual(second_response.status_code, 200)
         self.assertEqual(
-            self.state["users_by_id"][7]["mfa_secret"], returned_secret
+            parse_qs(urlparse(
+                second_response.get_json()["provisioning_uri"]
+            ).query)["secret"][0],
+            returned_secret
         )
 
     def test_enrollment_requires_token_and_privileged_role(self):
@@ -221,26 +293,27 @@ class MfaRouteTests(unittest.TestCase):
         self.state["users_by_id"][7]["role"] = "patient"
         response = self.client.post(
             "/api/mfa/enroll",
-            headers=self.authorization_headers(role="patient"),
+            headers=self.setup_headers(role="patient"),
         )
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 401)
         self.assertIsNone(self.state["users_by_id"][7]["mfa_secret"])
 
-    def test_privileged_login_without_code_uses_generic_failure(self):
+    def test_privileged_login_without_code_requires_mfa(self):
         self.enable_mfa()
 
         missing_code = self.login()
         wrong_password = self.login(password="incorrect-password")
 
-        self.assertEqual(missing_code.status_code, 401)
+        self.assertEqual(missing_code.status_code, 200)
         self.assertEqual(wrong_password.status_code, 401)
         self.assertEqual(
-            missing_code.get_json()["message"],
-            wrong_password.get_json()["message"],
+            missing_code.get_json()["status"], "mfa_required"
         )
-        self.assertEqual(
-            missing_code.get_json()["message"], "Invalid email or password"
-        )
+        self.assertFalse(any(
+            cookie.startswith("medilink_session=")
+            and cookie.split("=", 1)[1].split(";", 1)[0]
+            for cookie in missing_code.headers.getlist("Set-Cookie")
+        ))
 
     def test_privileged_login_with_wrong_code_is_rejected_generically(self):
         self.enable_mfa()
@@ -258,9 +331,9 @@ class MfaRouteTests(unittest.TestCase):
 
         response = self.login()
 
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(
-            response.get_json()["message"], "Invalid email or password"
+            response.get_json()["status"], "mfa_setup_required"
         )
 
     def test_admin_and_doctor_login_with_current_code_is_accepted(self):

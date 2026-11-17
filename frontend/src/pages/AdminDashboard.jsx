@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { API_BASE_URL } from "../config";
+import { apiFetch } from "../api";
 import "./AdminDashboard.css";
-
-const API = API_BASE_URL;
 
 const NAV_ITEMS = [
   ["overview", "Overview", "OV"],
@@ -91,16 +89,12 @@ function AdminDashboard() {
   const [doctorDraft, setDoctorDraft] = useState(null);
   const [reportDraft, setReportDraft] = useState(null);
   const [doctorAppointments, setDoctorAppointments] = useState(null);
+  const [inviteFormOpen, setInviteFormOpen] = useState(false);
+  const [inviteRole, setInviteRole] = useState("doctor");
+  const [inviteUrl, setInviteUrl] = useState("");
 
   const apiRequest = useCallback(async (path, options = {}) => {
-    const response = await fetch(`${API}${path}`, {
-      ...options,
-      credentials: "include",
-      headers: {
-        ...(options.body ? { "Content-Type": "application/json" } : {}),
-        ...options.headers,
-      },
-    });
+    const response = await apiFetch(path, options);
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
       if (response.status === 401 || response.status === 403) {
@@ -307,6 +301,49 @@ function AdminDashboard() {
     if (saved) setDoctorDraft(null);
   };
 
+  const submitInvite = async (event) => {
+    event.preventDefault();
+    setError("");
+    setNotice("");
+    setInviteUrl("");
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      const data = await apiRequest("/api/admin/users/invite", {
+        method: "POST",
+        body: JSON.stringify(values),
+      });
+      setInviteUrl(data.invite_url);
+      setInviteFormOpen(false);
+      setNotice(data.email_sent
+        ? "Invitation created and emailed. Copy the link if you need to share it separately."
+        : data.email_warning || "Invitation created. Copy the link and share it securely.");
+      await loadDashboard();
+    } catch (requestError) {
+      setError(requestError.message || "Unable to invite user.");
+    }
+  };
+
+  const resetUserMfa = (userId) => {
+    const reason = window.prompt("Enter the reason for resetting MFA:");
+    if (!reason?.trim()) return;
+    return runAction(
+      () => apiRequest(`/api/admin/users/${userId}/mfa/reset`, {
+        method: "POST",
+        body: JSON.stringify({ reason: reason.trim() }),
+      }),
+      "MFA reset. The user must enroll again."
+    );
+  };
+
+  const copyInviteUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      setNotice("Invitation link copied.");
+    } catch {
+      setError("Could not copy the invitation link. Select and copy it manually.");
+    }
+  };
+
   const submitAppointmentStatus = (appointmentId, status) => runAction(
     () => apiRequest(`/api/admin/appointments/${appointmentId}/status`, {
       method: "PATCH",
@@ -362,9 +399,8 @@ function AdminDashboard() {
 
   const logout = async () => {
     try {
-      await fetch(`${API}/api/logout`, {
+      await apiFetch("/api/logout", {
         method: "POST",
-        credentials: "include",
       });
     } catch (logoutError) {
       console.error("Logout request failed:", logoutError);
@@ -605,17 +641,105 @@ function AdminDashboard() {
 
         {section === "users" && (
           <section className="admin-panel">
-            <div className="panel-heading"><div><span className="admin-eyebrow">ACCOUNT ACCESS</span><h2>User management</h2></div></div>
+            <div className="panel-heading">
+              <div><span className="admin-eyebrow">ACCOUNT ACCESS</span><h2>User management</h2></div>
+              <button
+                className="primary-button"
+                onClick={() => setInviteFormOpen(!inviteFormOpen)}
+              >
+                {inviteFormOpen ? "Close invite form" : "Invite user"}
+              </button>
+            </div>
+            {inviteFormOpen && (
+              <form className="admin-form" onSubmit={submitInvite}>
+                <h3>Invite a doctor or administrator</h3>
+                <label>
+                  Full name
+                  <input name="full_name" required maxLength="100" />
+                </label>
+                <label>
+                  Email
+                  <input name="email" type="email" required maxLength="150" />
+                </label>
+                <label>
+                  Role
+                  <select
+                    name="role"
+                    value={inviteRole}
+                    onChange={(event) => setInviteRole(event.target.value)}
+                  >
+                    <option value="doctor">Doctor</option>
+                    <option value="admin">Administrator</option>
+                  </select>
+                </label>
+                {inviteRole === "doctor" && (
+                  <>
+                    <label>
+                      Specialty
+                      <input name="specialty" required maxLength="100" />
+                    </label>
+                    <label>
+                      Hospital
+                      <select name="hospital_id" required defaultValue="">
+                        <option value="" disabled>Select a hospital</option>
+                        {activeHospitals.map((hospital) => (
+                          <option
+                            key={hospital.hospital_id}
+                            value={hospital.hospital_id}
+                          >
+                            {hospital.hospital_name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </>
+                )}
+                <p className="form-note">
+                  The invitation expires after 48 hours. The recipient must set a
+                  password and complete MFA before accessing the portal.
+                </p>
+                <div className="form-actions">
+                  <button className="primary-button" type="submit">
+                    Create invitation
+                  </button>
+                </div>
+              </form>
+            )}
+            {inviteUrl && (
+              <div className="invite-link-panel">
+                <label htmlFor="invite-link">Invitation link</label>
+                <div>
+                  <input id="invite-link" readOnly value={inviteUrl} />
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={copyInviteUrl}
+                  >
+                    Copy link
+                  </button>
+                </div>
+              </div>
+            )}
             <SearchBar value={search} onChange={setSearch} placeholder="Search by name, email or role…" />
             <div className="admin-table-wrapper">
               <table>
-                <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Role</th><th>Account status</th><th>Created</th><th>Actions</th></tr></thead>
+                <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Role</th><th>Account status</th><th>MFA</th><th>Created</th><th>Actions</th></tr></thead>
                 <tbody>
                   {filtered(users, "full_name", "email", "role").map((item) => (
                     <tr key={item.user_id}>
-                      <td>{item.user_id}</td><td>{item.full_name}</td><td>{item.email}</td><td className="capitalize">{item.role}</td><td><StatusBadge value={item.account_status} /></td><td>{formatDate(item.created_at, true)}</td>
+                      <td>{item.user_id}</td>
+                      <td>{item.full_name}</td>
+                      <td>{item.email}</td>
+                      <td className="capitalize">{item.role}</td>
+                      <td><StatusBadge value={item.account_status} /></td>
+                      <td>{["admin", "doctor"].includes(item.role)
+                        ? <StatusBadge value={item.mfa_enabled ? "Enabled" : "Required"} />
+                        : "Not required"}</td>
+                      <td>{formatDate(item.created_at, true)}</td>
                       <td>{String(item.user_id) === String(user?.user_id) ? <span className="muted-text">Current account</span> : <div className="admin-actions">
-                        {item.account_status === "active"
+                        {item.account_status === "pending"
+                          ? <span className="muted-text">Invitation pending</span>
+                          : item.account_status === "active"
                           ? <button className="suspend-button" onClick={() => updateUserStatus(item.user_id, "suspended")}>Suspend</button>
                           : item.account_status === "suspended"
                             ? <button className="primary-button" onClick={() => updateUserStatus(item.user_id, "active")}>Reactivate</button>
@@ -625,10 +749,18 @@ function AdminDashboard() {
                             updateUserStatus(item.user_id, "deactivated");
                           }
                         }}>Deactivate</button>}
+                        {["admin", "doctor"].includes(item.role) && (
+                          <button
+                            className="secondary-button"
+                            onClick={() => resetUserMfa(item.user_id)}
+                          >
+                            Reset MFA
+                          </button>
+                        )}
                       </div>}</td>
                     </tr>
                   ))}
-                  {!users.length && <TableMessage columns={7}>No users returned.</TableMessage>}
+                  {!users.length && <TableMessage columns={8}>No users returned.</TableMessage>}
                 </tbody>
               </table>
             </div>
