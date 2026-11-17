@@ -1,0 +1,3 @@
+MediLink Health - Dummy Patient Report
+Patient: Ali Ahmed
+Diagnosis: Flu

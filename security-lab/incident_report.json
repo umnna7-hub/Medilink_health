@@ -1,0 +1,131 @@
+{
+    "incident_id": "MLH-IR-001",
+    "type": "Ransomware / Double Extortion",
+    "severity": "Critical",
+    "status": "Simulation Completed",
+    "detected_at": "2026-11-14T17:48:36.012452",
+    "compromised_account": "employee_test_01",
+    "affected_systems": [
+        "Workstation-01",
+        "Workstation-02",
+        "Patient-Portal-Test"
+    ],
+    "entry_point": "Outdated appointment application",
+    "actions": [
+        {
+            "timestamp": "2026-11-14T17:48:36.013034",
+            "stage": "DETECTION",
+            "action": "Ransomware alert detected on test workstations."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.013112",
+            "stage": "DETECTION",
+            "action": "Suspicious employee account activity identified."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.013316",
+            "stage": "CONTAINMENT",
+            "action": "Compromised test account temporarily disabled."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.013382",
+            "stage": "CONTAINMENT",
+            "action": "Affected test workstations isolated."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.013447",
+            "stage": "CONTAINMENT",
+            "action": "Suspicious remote access restricted."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.013516",
+            "stage": "CONTAINMENT",
+            "action": "Backup systems protected from unauthorized access."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.013705",
+            "stage": "INVESTIGATION",
+            "action": "Entry point identified: outdated appointment application."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.013765",
+            "stage": "INVESTIGATION",
+            "action": "Database and access logs reviewed for unauthorized activity."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.013830",
+            "stage": "INVESTIGATION",
+            "action": "Potentially affected patient records identified for assessment."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.013998",
+            "stage": "ERADICATION",
+            "action": "Malware removal simulated on affected test systems."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.014085",
+            "stage": "ERADICATION",
+            "action": "Application vulnerability patched in the test environment."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.014162",
+            "stage": "ERADICATION",
+            "action": "Compromised credentials scheduled for secure replacement."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.015274",
+            "stage": "RECOVERY",
+            "action": "Integrity verification failed or baseline is unavailable."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.015352",
+            "stage": "RECOVERY",
+            "action": "Recovery blocked until a trusted file is verified."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.015420",
+            "stage": "RECOVERY",
+            "action": "Clinical systems require clinical and technical approval before restoration."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.015599",
+            "stage": "COMMUNICATION",
+            "action": "Management and incident response team notified."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.015660",
+            "stage": "COMMUNICATION",
+            "action": "IT staff instructed to follow containment procedures."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.015725",
+            "stage": "COMMUNICATION",
+            "action": "Legal and compliance teams informed to assess reporting obligations."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.015779",
+            "stage": "COMMUNICATION",
+            "action": "Affected patients will be notified if required after assessing the data breach."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.015835",
+            "stage": "COMMUNICATION",
+            "action": "Only an authorized spokesperson may issue public statements."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.015994",
+            "stage": "RANSOM DECISION",
+            "action": "Ransom payment is not automatically authorized."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.016053",
+            "stage": "RANSOM DECISION",
+            "action": "Management, legal experts, and cybersecurity specialists must assess the demand."
+        },
+        {
+            "timestamp": "2026-11-14T17:48:36.016123",
+            "stage": "RANSOM DECISION",
+            "action": "Payment does not guarantee data recovery or prevent stolen data from being published."
+        }
+    ]
+}
